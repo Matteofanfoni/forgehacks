@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DEMO_CONTACTS, REAL_RELATIVE_LINES, SCAMMER_SCRIPT } from "@/lib/demo";
+import { DEMO_CONTACTS } from "@/lib/demo";
 import type { Analysis, Challenge, Contact, ScoreResult, Verdict } from "@/lib/types";
 
 type Screen = "vault" | "call" | "verdict";
@@ -52,6 +52,10 @@ export default function Home() {
   const [busy, setBusy] = useState<"" | "challenge" | "score">("");
   const [listening, setListening] = useState(false);
   const [error, setError] = useState("");
+  const [sim, setSim] = useState<"clone" | "clever" | "real" | null>(null);
+  const [callerBusy, setCallerBusy] = useState(false);
+  const [voiceOn, setVoiceOn] = useState(true);
+  const [answerListening, setAnswerListening] = useState(false);
 
   const recRef = useRef<SpeechRecognition | null>(null);
   const scriptIdx = useRef(0);
@@ -173,7 +177,7 @@ export default function Home() {
     setBusy("");
   };
 
-  const submitReply = async () => {
+  const submitReply = async (text: string = reply) => {
     if (!contact || !challenge) return;
     const fact = contact.facts.find((f) => f.id === challenge.factId);
     if (!fact) return;
@@ -183,9 +187,9 @@ export default function Home() {
       const score = await post<ScoreResult>("/api/score", {
         question: challenge.question,
         answer: fact.answer,
-        reply,
+        reply: text,
       });
-      setRounds((r) => [...r, { question: challenge.question, answer: fact.answer, reply, score }]);
+      setRounds((r) => [...r, { question: challenge.question, answer: fact.answer, reply: text, score }]);
       setChallenge(null);
       setReply("");
     } catch {
@@ -194,10 +198,86 @@ export default function Home() {
     setBusy("");
   };
 
-  const playScript = () => {
-    const line = SCAMMER_SCRIPT[scriptIdx.current % SCAMMER_SCRIPT.length];
-    scriptIdx.current += 1;
-    setTranscript((t) => (t + " " + line).trim());
+  // ---- Test Lab: simulated caller (so the whole flow can be tried without a phone) ----
+  const speak = (text: string) => {
+    if (!voiceOn || typeof speechSynthesis === "undefined") return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.02;
+    speechSynthesis.speak(u);
+  };
+
+  const callerSpeaks = async () => {
+    if (!contact || !sim) return;
+    setCallerBusy(true);
+    setError("");
+    try {
+      const out = await post<{ line: string }>("/api/caller", {
+        scenario: sim,
+        name: contact.name,
+        relation: contact.relation,
+        facts: contact.facts,
+        history: transcript,
+        turn: scriptIdx.current,
+      });
+      scriptIdx.current += 1;
+      setTranscript((t) => (t + " " + out.line).trim());
+      speak(out.line);
+    } catch {
+      setError("The simulated caller failed to respond.");
+    }
+    setCallerBusy(false);
+  };
+
+  const callerAnswers = async () => {
+    if (!contact || !sim || !challenge) return;
+    setCallerBusy(true);
+    setError("");
+    try {
+      const out = await post<{ line: string }>("/api/caller", {
+        scenario: sim,
+        name: contact.name,
+        relation: contact.relation,
+        facts: contact.facts,
+        history: transcript,
+        question: challenge.question,
+        turn: scriptIdx.current,
+      });
+      scriptIdx.current += 1;
+      setReply(out.line);
+      speak(out.line);
+      setCallerBusy(false);
+      await submitReply(out.line);
+      return;
+    } catch {
+      setError("The simulated caller failed to respond.");
+    }
+    setCallerBusy(false);
+  };
+
+  // Listen once for the caller's spoken answer to the challenge question (real-call path).
+  const listenForAnswer = () => {
+    const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    if (!Ctor) {
+      setError("Speech recognition isn't supported in this browser. Use Chrome, or type the answer.");
+      return;
+    }
+    const rec = new Ctor();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = "en-US";
+    setAnswerListening(true);
+    rec.onresult = (e: SpeechRecognitionEvent) => {
+      const text = e.results[0]?.[0]?.transcript ?? "";
+      setAnswerListening(false);
+      if (text) {
+        setReply(text);
+        void submitReply(text);
+      }
+    };
+    rec.onend = () => setAnswerListening(false);
+    rec.onerror = () => setAnswerListening(false);
+    rec.start();
   };
 
   const risk = analysis?.risk ?? 0;
@@ -290,13 +370,9 @@ export default function Home() {
           <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-slate-300">What the caller is saying</h3>
-              <div className="flex gap-2 text-xs">
-                <button className="rounded border border-slate-600 px-2 py-1 hover:bg-slate-800" onClick={playScript}>Demo: scammer line</button>
-                <button className="rounded border border-slate-600 px-2 py-1 hover:bg-slate-800" onClick={() => setTranscript((t) => (t + " " + REAL_RELATIVE_LINES[0]).trim())}>Demo: real relative</button>
-                <button className={`rounded px-2 py-1 font-medium ${listening ? "bg-red-500 text-white" : "bg-emerald-500 text-slate-900"}`} onClick={toggleListening}>
-                  {listening ? "● Stop mic" : "🎙 Listen"}
-                </button>
-              </div>
+              <button className={`rounded px-3 py-1 text-xs font-medium ${listening ? "bg-red-500 text-white" : "bg-emerald-500 text-slate-900"}`} onClick={toggleListening}>
+                {listening ? "● Stop mic" : "🎙 Listen to the call"}
+              </button>
             </div>
             <textarea className={`${input} h-28 w-full`} placeholder="Live transcript appears here. You can also type or paste what the caller says."
               value={transcript} onChange={(e) => setTranscript(e.target.value)} />
@@ -311,6 +387,45 @@ export default function Home() {
             {analysis?.summary && <p className="mt-2 text-xs text-slate-400">{analysis.summary} <span className="opacity-60">({analysis.source === "llm" ? "AI" : "offline rules"})</span></p>}
           </div>
 
+          {risk >= 40 && !challenge && rounds.length === 0 && (
+            <div className="rounded-xl border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-200">
+              🚨 This call shows scam pressure tactics. <b>Don&apos;t send anything.</b> Verify the caller below before you do anything else.
+            </div>
+          )}
+
+          <div className="rounded-xl border border-violet-500/40 bg-violet-500/5 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-violet-300">🧪 Test Lab — simulated caller (no phone needed)</h3>
+              <label className="flex items-center gap-1 text-xs text-slate-400">
+                <input type="checkbox" checked={voiceOn} onChange={(e) => setVoiceOn(e.target.checked)} /> Caller speaks aloud
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs">
+              {([
+                ["clone", "🎭 Voice-clone scammer"],
+                ["clever", "🕵️ Clever bluffing scammer"],
+                ["real", `✅ Real ${contact.name || "relative"}`],
+              ] as const).map(([k, label]) => (
+                <button key={k} className={chip(sim === k)} onClick={() => { setSim(k); scriptIdx.current = 0; }}>{label}</button>
+              ))}
+            </div>
+            {sim && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button className="rounded-lg bg-violet-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40" onClick={callerSpeaks} disabled={callerBusy}>
+                  {callerBusy ? "…" : transcript ? "Caller keeps talking" : "Caller starts talking"}
+                </button>
+                {challenge && (
+                  <button className="rounded-lg bg-violet-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40" onClick={callerAnswers} disabled={callerBusy || busy !== ""}>
+                    Caller answers my question
+                  </button>
+                )}
+              </div>
+            )}
+            <p className="mt-2 text-xs text-slate-500">
+              The AI plays the caller. The scammers know nothing private about your family; the real relative does. Pick one, let them talk, ask the question, and watch the verdict.
+            </p>
+          </div>
+
           <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-4">
             <h3 className="mb-2 text-sm font-semibold text-emerald-300">Verify them</h3>
             {!challenge ? (
@@ -322,9 +437,14 @@ export default function Home() {
                 <p className="text-xs text-slate-400">Say this to the caller:</p>
                 <p className="rounded-lg bg-slate-900 p-3 text-lg font-medium">“{challenge.question}”</p>
                 <textarea className={`${input} h-16 w-full`} placeholder="Type (or paste) what the caller answered…" value={reply} onChange={(e) => setReply(e.target.value)} />
-                <button className="rounded-lg bg-emerald-500 px-4 py-2 font-semibold text-slate-900 disabled:opacity-40" onClick={submitReply} disabled={busy !== ""}>
-                  {busy === "score" ? "Checking…" : "Check their answer"}
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button className={`rounded-lg px-4 py-2 font-semibold disabled:opacity-40 ${answerListening ? "bg-red-500 text-white" : "bg-slate-100 text-slate-900"}`} onClick={listenForAnswer} disabled={busy !== "" || answerListening}>
+                    {answerListening ? "● Listening for their answer…" : "🎙 Listen for their answer"}
+                  </button>
+                  <button className="rounded-lg bg-emerald-500 px-4 py-2 font-semibold text-slate-900 disabled:opacity-40" onClick={() => submitReply()} disabled={busy !== "" || !reply.trim()}>
+                    {busy === "score" ? "Checking…" : "Check typed answer"}
+                  </button>
+                </div>
               </div>
             )}
             {rounds.length > 0 && (
